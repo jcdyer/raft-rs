@@ -74,7 +74,7 @@ where
     }
 
     pub fn finalize(&mut self) -> Result<Server<L, M>> {
-        Server::new( 
+        Server::new(
             replace(&mut self.id, None).expect("Server not configured with ID"),
             replace(&mut self.addr, None).expect("Server not configured with SocketAddr"),
             replace(&mut self.peers, None).unwrap_or(HashMap::new()).clone(),
@@ -97,7 +97,7 @@ where
     pub fn with_peers(mut self, peers: HashMap<ServerId, SocketAddr>) -> ServerBuilder<L, M> {
         self.peers = Some(peers);
         self
-            
+
     }
     pub fn with_max_connections(mut self, count: usize) -> ServerBuilder<L, M> {
         self.max_connections = count;
@@ -193,7 +193,7 @@ impl<L, M> Server<L, M>
             return Err(Error::Raft(RaftError::InvalidPeerSet));
         }
 
-        let timeout_config = TimeoutConfiguration { 
+        let timeout_config = TimeoutConfiguration {
             election_min_ms: election_min_millis,
             election_max_ms: election_max_millis,
             heartbeat_ms: heartbeat_millis,
@@ -254,17 +254,11 @@ impl<L, M> Server<L, M>
     /// * `peers` - The ID and address of all peers in the Raft cluster.
     /// * `store` - The persistent log store.
     /// * `state_machine` - The client state machine to which client commands will be applied.
-    pub fn run(id: ServerId,
-               addr: SocketAddr,
-               peers: HashMap<ServerId, SocketAddr>,
-               store: L,
-               state_machine: M)
-               -> Result<()> {
-        let mut server = try!(Server::new(id, addr, peers, store, state_machine, 1500, 3000, 1000));
-        let mut event_loop = try!(server.start_loop());
-        let actions = server.consensus.init();
-        server.execute_actions(&mut event_loop, actions);
-        event_loop.run(&mut server).map_err(From::from)
+    pub fn run(&mut self) -> Result<()> {
+        let mut event_loop = try!(self.start_loop());
+        let actions = self.consensus.init();
+        self.execute_actions(&mut event_loop, actions);
+        event_loop.run(self).map_err(From::from)
     }
 
     /// Spawns a new Raft server in a background thread.
@@ -284,10 +278,12 @@ impl<L, M> Server<L, M>
                  -> Result<JoinHandle<Result<()>>> {
         thread::Builder::new()
             .name(format!("raft::Server({})", id))
-            .spawn(move || Server::run(id, addr, peers, store, state_machine))
+            .spawn(move || {
+                let mut server = try!(Server::new(id, addr, peers, store, state_machine, 1500, 3000, 1000));
+                server.run()
+            })
             .map_err(From::from)
     }
-
     /// Sends the message to the connection associated with the provided token.
     /// If sending the message fails, the connection is reset.
     fn send_message(&mut self,
