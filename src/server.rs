@@ -6,6 +6,7 @@
 use std::{fmt, io};
 use std::str::FromStr;
 use std::collections::HashMap;
+use std::mem::replace;
 use std::net::SocketAddr;
 use std::thread::{self, JoinHandle};
 use std::rc::Rc;
@@ -23,7 +24,7 @@ use RaftError;
 use ServerId;
 use messages;
 use messages_capnp::connection_preamble;
-use consensus::{Consensus, Actions, ConsensusTimeout};
+use consensus::{Consensus, Actions, ConsensusTimeout, TimeoutConfiguration};
 use state_machine::StateMachine;
 use persistent_log::Log;
 use connection::{Connection, ConnectionKind};
@@ -35,6 +36,93 @@ const LISTENER: Token = Token(0);
 pub enum ServerTimeout {
     Consensus(ConsensusTimeout),
     Reconnect(Token),
+}
+
+pub struct ServerBuilder<L, M>
+where
+    L: Log,
+    M: StateMachine,
+{
+    id: Option<ServerId>,
+    addr: Option<SocketAddr>,
+    peers: Option<HashMap<ServerId, SocketAddr>>,
+    max_connections: usize,
+    store: Option<L>,
+    state_machine: Option<M>,
+    election_min_millis: u64,
+    election_max_millis: u64,
+    heartbeat_millis: u64,
+}
+
+impl <L, M> ServerBuilder<L, M>
+where
+    L: Log,
+    M: StateMachine
+{
+    fn new() -> ServerBuilder<L, M> {
+        ServerBuilder {
+            id: None,
+            addr: None,
+            peers: None,
+            max_connections: 129,
+            store: None,
+            state_machine: None,
+            election_min_millis: 150,
+            election_max_millis: 350,
+            heartbeat_millis: 60,
+        }
+    }
+
+    pub fn finalize(&mut self) -> Result<Server<L, M>> {
+        Server::new( 
+            replace(&mut self.id, None).expect("Server not configured with ID"),
+            replace(&mut self.addr, None).expect("Server not configured with SocketAddr"),
+            replace(&mut self.peers, None).unwrap_or(HashMap::new()).clone(),
+            replace(&mut self.store, None).expect("Server not configured with Log"),
+            replace(&mut self.state_machine, None).expect("Server not configured with StateMachine"),
+            self.election_min_millis,
+            self.election_max_millis,
+            self.heartbeat_millis,
+        )
+    }
+
+    pub fn with_id(mut self, id: ServerId) -> ServerBuilder<L, M> {
+        self.id = Some(id);
+        self
+    }
+    pub fn with_addr(mut self, addr: SocketAddr) -> ServerBuilder<L, M> {
+        self.addr = Some(addr);
+        self
+    }
+    pub fn with_peers(mut self, peers: HashMap<ServerId, SocketAddr>) -> ServerBuilder<L, M> {
+        self.peers = Some(peers);
+        self
+            
+    }
+    pub fn with_max_connections(mut self, count: usize) -> ServerBuilder<L, M> {
+        self.max_connections = count;
+        self
+    }
+    pub fn with_store(mut self, store: L) -> ServerBuilder<L, M> {
+        self.store = Some(store);
+        self
+    }
+    pub fn with_state_machine(mut self, state_machine: M) -> ServerBuilder<L, M> {
+        self.state_machine = Some(state_machine);
+        self
+    }
+    pub fn with_election_min_millis(mut self, timeout: u64) -> ServerBuilder<L, M> {
+        self.election_min_millis = timeout;
+        self
+    }
+    pub fn with_election_max_millis(mut self, timeout: u64) -> ServerBuilder<L, M> {
+        self.election_max_millis = timeout;
+        self
+    }
+    pub fn with_heartbeat_millis(mut self, timeout: u64) -> ServerBuilder<L, M> {
+        self.heartbeat_millis = timeout;
+        self
+    }
 }
 
 /// The `Server` is responsible for receiving events from peer `Server` instance or clients,
@@ -76,6 +164,9 @@ pub struct Server<L, M>
 
     /// Currently registered reconnection timeouts.
     reconnection_timeouts: HashMap<Token, TimeoutHandle>,
+
+    /// Configured timeouts
+    timeout_config: TimeoutConfiguration,
 }
 
 /// The implementation of the Server.
@@ -83,22 +174,32 @@ impl<L, M> Server<L, M>
     where L: Log,
           M: StateMachine
 {
+    pub fn builder() -> ServerBuilder<L, M> {
+        ServerBuilder::new()
+    }
+
     /// Creates a new instance of the server.
     /// *Gotcha:* `peers` must not contain the local `id`.
     fn new(id: ServerId,
            addr: SocketAddr,
            peers: HashMap<ServerId, SocketAddr>,
            store: L,
-           state_machine: M)
-           -> Result<(Server<L, M>, EventLoop<Server<L, M>>)> {
+           state_machine: M,
+           election_min_millis: u64,
+           election_max_millis: u64,
+           heartbeat_millis: u64)
+           -> Result<Server<L, M>> {
         if peers.contains_key(&id) {
             return Err(Error::Raft(RaftError::InvalidPeerSet));
         }
 
+        let timeout_config = TimeoutConfiguration { 
+            election_min_ms: election_min_millis,
+            election_max_ms: election_max_millis,
+            heartbeat_ms: heartbeat_millis,
+        };
         let consensus = Consensus::new(id, peers.clone(), store, state_machine);
-        let mut event_loop = try!(EventLoop::<Server<L, M>>::new());
         let listener = try!(TcpListener::bind(&addr));
-        try!(event_loop.register(&listener, LISTENER, EventSet::all(), PollOpt::level()));
 
         let mut server = Server {
             id: id,
@@ -109,6 +210,7 @@ impl<L, M> Server<L, M>
             client_tokens: HashMap::new(),
             consensus_timeouts: HashMap::new(),
             reconnection_timeouts: HashMap::new(),
+            timeout_config: timeout_config,
         };
 
         for (peer_id, peer_addr) in peers {
@@ -118,16 +220,31 @@ impl<L, M> Server<L, M>
                                               Error::Raft(RaftError::ConnectionLimitReached)
                                           }));
             scoped_assert!(server.peer_tokens.insert(peer_id, token).is_none());
+        }
+        Ok(server)
+    }
 
-            try!(server.connections[token].register(&mut event_loop, token));
-            server.send_message(&mut event_loop,
+    fn start_loop(&mut self) -> Result<EventLoop<Server<L, M>>>
+    where
+        L: Log,
+        M: StateMachine
+    {
+        let mut event_loop = try!(EventLoop::<Server<L, M>>::new());
+        try!(event_loop.register(&self.listener, LISTENER, EventSet::all(), PollOpt::level()));
+        let mut tokens = vec![];
+        for token in self.peer_tokens.values() {
+            tokens.push(token.clone());
+        }
+        let id = self.id;
+        let addr = self.listener.local_addr().unwrap();
+        for token in tokens {
+            try!(self.connections[token].register(&mut event_loop, token));
+            self.send_message(&mut event_loop,
                                 token,
                                 messages::server_connection_preamble(id, &addr));
         }
-
-        Ok((server, event_loop))
+        Ok(event_loop)
     }
-
     /// Runs a new Raft server in the current thread.
     ///
     /// # Arguments
@@ -143,7 +260,8 @@ impl<L, M> Server<L, M>
                store: L,
                state_machine: M)
                -> Result<()> {
-        let (mut server, mut event_loop) = try!(Server::new(id, addr, peers, store, state_machine));
+        let mut server = try!(Server::new(id, addr, peers, store, state_machine, 1500, 3000, 1000));
+        let mut event_loop = try!(server.start_loop());
         let actions = server.consensus.init();
         server.execute_actions(&mut event_loop, actions);
         event_loop.run(&mut server).map_err(From::from)
@@ -221,7 +339,7 @@ impl<L, M> Server<L, M>
             self.consensus_timeouts.clear();
         }
         for timeout in timeouts {
-            let duration = timeout.duration_ms();
+            let duration = timeout.duration_ms(&self.timeout_config);
 
             // Registering a timeout may only fail if the maximum number of timeouts
             // is already registered, which is by default 65,536. We use a
@@ -528,11 +646,16 @@ mod tests {
 
     fn new_test_server(peers: HashMap<ServerId, SocketAddr>)
                        -> Result<(TestServer, EventLoop<TestServer>)> {
-        Server::new(ServerId::from(0),
-                    SocketAddr::from_str("127.0.0.1:0").unwrap(),
-                    peers,
-                    MemLog::new(),
-                    NullStateMachine)
+        let mut server = try!(Server::new(ServerId::from(0),
+                                          SocketAddr::from_str("127.0.0.1:0").unwrap(),
+                                          peers,
+                                          MemLog::new(),
+                                          NullStateMachine,
+                                          1500,
+                                          3000,
+                                          1000));
+        let event_loop = try!(server.start_loop());
+        Ok((server, event_loop))
     }
 
     /// Attempts to grab a local, unbound socket address for testing.
