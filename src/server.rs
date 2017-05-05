@@ -64,12 +64,12 @@ where
             id: None,
             addr: None,
             peers: None,
-            max_connections: 129,
             store: None,
             state_machine: None,
             election_min_millis: 150,
             election_max_millis: 350,
             heartbeat_millis: 60,
+            max_connections: 129,
         }
     }
 
@@ -83,6 +83,7 @@ where
             self.election_min_millis,
             self.election_max_millis,
             self.heartbeat_millis,
+            self.max_connections,
         )
     }
 
@@ -187,7 +188,8 @@ impl<L, M> Server<L, M>
            state_machine: M,
            election_min_millis: u64,
            election_max_millis: u64,
-           heartbeat_millis: u64)
+           heartbeat_millis: u64,
+           max_connections: usize)
            -> Result<Server<L, M>> {
         if peers.contains_key(&id) {
             return Err(Error::Raft(RaftError::InvalidPeerSet));
@@ -205,7 +207,7 @@ impl<L, M> Server<L, M>
             id: id,
             consensus: consensus,
             listener: listener,
-            connections: Slab::new_starting_at(Token(1), 129),
+            connections: Slab::new_starting_at(Token(1), max_connections),
             peer_tokens: HashMap::new(),
             client_tokens: HashMap::new(),
             consensus_timeouts: HashMap::new(),
@@ -279,7 +281,7 @@ impl<L, M> Server<L, M>
         thread::Builder::new()
             .name(format!("raft::Server({})", id))
             .spawn(move || {
-                let mut server = try!(Server::new(id, addr, peers, store, state_machine, 1500, 3000, 1000));
+                let mut server = try!(Server::new(id, addr, peers, store, state_machine, 1500, 3000, 1000, 129));
                 server.run()
             })
             .map_err(From::from)
@@ -649,7 +651,8 @@ mod tests {
                                           NullStateMachine,
                                           1500,
                                           3000,
-                                          1000));
+                                          1000,
+                                          129));
         let event_loop = try!(server.start_loop());
         Ok((server, event_loop))
     }
