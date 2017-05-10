@@ -39,6 +39,8 @@ impl ::std::convert::From<::std::io::Error> for Error {
     }
 }
 
+pub type Result<T> = result::Result<T, Error>;
+pub type Entry = (Term, Vec<u8>);
 
 #[derive(Debug)]
 pub struct FsLog {
@@ -46,6 +48,7 @@ pub struct FsLog {
     current_term: Term,
     voted_for: Option<ServerId>,
     entries: Vec<(Term, Vec<u8>)>,
+    offsets: Vec<u64>,
 }
 
 impl Clone for FsLog {
@@ -56,16 +59,16 @@ impl Clone for FsLog {
             current_term: self.current_term.clone(),
             voted_for: self.voted_for.clone(),
             entries: self.entries.clone(),
+            offsets: self.offsets.clone(),
         }
     }
 }
     
-fn u64_from_u8s(input: &[u8]) -> Option<u64> {
+fn u64_from_u8s(input: &[u8]) -> u64 {
     if input.len() != 8 {
-        None 
+        panic!("Need a &[u8] of length 8 to build a u64")
     } else {
-        Some(
-            ((input[0] as u64) << 56)
+        ((input[0] as u64) << 56)
             + ((input[1] as u64) << 48)
             + ((input[2] as u64) << 40)
             + ((input[3] as u64) << 32)
@@ -73,7 +76,6 @@ fn u64_from_u8s(input: &[u8]) -> Option<u64> {
             + ((input[5] as u64) << 16)
             + ((input[6] as u64) << 8)
             + (input[7] as u64)
-        )
     }
 }
 
@@ -93,7 +95,7 @@ fn u64_to_u8s(input: u64) -> [u8; 8] {
 /// Stores log as 8 bytes for current_term, 8 bytes for voted_for, and 
 /// As much as needed for the log.
 impl FsLog {
-    pub fn new(filename: &path::Path) -> Result<FsLog, Error> {
+    pub fn new(filename: &path::Path) -> Result<FsLog> {
         let mut f = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -101,7 +103,7 @@ impl FsLog {
             .open(filename)?;
 
         let mut buf = [0u8; 8];
-        let voted_buf = [0xff as u8; 8];
+        let not_voted = [0xff as u8; 8];
         
         { 
             let mut read_buf = Vec::new();
@@ -110,33 +112,44 @@ impl FsLog {
             f.seek(SeekFrom::Start(0)).unwrap();
         }
                  
-        assert_eq!(f.seek(SeekFrom::Start(0)).unwrap(), 0);
-        if f.metadata()?.len() == 0 {
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 0);
+        let filelen = f.metadata()?.len();
+        if filelen == 0 {
             println!("Empty file");
             f.write_all(&buf)?;
-            f.write_all(&voted_buf)?;
+            f.write_all(&not_voted)?;
             f.seek(SeekFrom::Start(0))?;
         }
 
         f.read_exact(&mut buf)?;
-        let current_term: Term = u64_from_u8s(&buf).unwrap().into();
+        let current_term: Term = u64_from_u8s(&buf).into();
 
         f.read_exact(&mut buf)?;
-        let voted_for: Option<ServerId> = match u64_from_u8s(&buf).unwrap() {
+        let voted_for: Option<ServerId> = match u64_from_u8s(&buf) {
             x if x == <u64>::max_value() => None,
             x => Some(x.into())
         };
-
-        let log = FsLog {
+        let mut log = FsLog {
             file: f,
             current_term: current_term,
             voted_for: voted_for,
             entries: Vec::new(),
+            offsets: Vec::new(),
         };
+
+        let mut offset = 16;
+        while offset < filelen {
+            log.offsets.push(offset);
+            let offset_len = log.offsets.len();
+            let entry = log.read_entry(offset_len - 1)?;
+            log.entries.push(entry);
+            offset = log.file.seek(SeekFrom::Current(0))?;
+            println!("Offset: {}", offset);
+        }
         Ok(log)
     }
 
-    fn print_file(&mut self) -> Result<(), Error> {
+    fn print_file(&mut self) -> Result<()> {
         let mut buf = Vec::new();
         self.file.seek(SeekFrom::Start(0))?;
         self.file.read_to_end(&mut buf)?;
@@ -144,14 +157,14 @@ impl FsLog {
         Ok(())
     }
 
-    fn write_term(&mut self) -> Result<(), Error> {
+    fn write_term(&mut self) -> Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&u64_to_u8s(self.current_term.into())[..])?;
         self.write_voted_for()?;
         Ok(())
     }
     
-    fn write_voted_for(&mut self) -> Result<(), Error> {
+    fn write_voted_for(&mut self) -> Result<()> {
         self.file.seek(SeekFrom::Start(8))?;
         self.file.write_all(
             &match self.voted_for {
@@ -161,44 +174,79 @@ impl FsLog {
         )?;
         Ok(())
     }
+
+    fn read_entry(&mut self, index: usize) -> Result<Entry> {
+        // Could be more efficient about not copying data here.
+        let offset = self.offsets.get(index).ok_or(Error)?;
+        self.file.seek(SeekFrom::Start(*offset))?;
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf);
+        let length = u64_from_u8s(&buf[..]) as usize;
+
+        let mut buf = Vec::with_capacity(length - 8);
+        self.file.read_exact(&mut buf[..])?;
+        let term = u64_from_u8s(&buf[..8]).into();
+        let command = (&buf[8..]).to_owned();
+        Ok((term, command))
+    }
+
+    ///Add an entry to the log
+    fn write_entry(&mut self, index: usize, entry: Entry) -> Result<()> {
+        if index > self.entries.len() {
+            Err(Error)
+        } else {
+            if index < self.entries.len() {
+                let offset = self.offsets.get(index).ok_or(Error)?;
+                self.file.set_len(*offset)?;
+            } 
+            let new_offset = self.file.seek(SeekFrom::End(0))?;
+            self.offsets.push(new_offset);
+            let (term, command) = entry;
+            let entry_len = (command.len() + 16) as u64;
+            self.file.write_all(&u64_to_u8s(entry_len)[..])?;
+            self.file.write_all(&u64_to_u8s(term.into())[..])?;
+            self.file.write_all(&command[..])?;
+            Ok(())
+        }
+    }
 }
 
 impl Log for FsLog {
     type Error = Error;
 
-    fn current_term(&self) -> result::Result<Term, Error> {
+    fn current_term(&self) -> Result<Term> {
         Ok(self.current_term)
     }
 
-    fn set_current_term(&mut self, term: Term) -> result::Result<(), Error> {
+    fn set_current_term(&mut self, term: Term) -> Result<()> {
         self.current_term = term;
         self.voted_for = None;
         self.write_term()?;
         Ok(())
     }
 
-    fn inc_current_term(&mut self) -> result::Result<Term, Error> {
+    fn inc_current_term(&mut self) -> Result<Term> {
         self.current_term = self.current_term + 1;
         self.voted_for = None;
         self.write_term()?;
         self.current_term()
     }
 
-    fn voted_for(&self) -> result::Result<Option<ServerId>, Error> {
+    fn voted_for(&self) -> Result<Option<ServerId>> {
         Ok(self.voted_for)
     }
 
-    fn set_voted_for(&mut self, address: ServerId) -> result::Result<(), Error> {
+    fn set_voted_for(&mut self, address: ServerId) -> Result<()> {
         self.voted_for = Some(address);
         self.write_voted_for()?;
         Ok(())
     }
 
-    fn latest_log_index(&self) -> result::Result<LogIndex, Error> {
+    fn latest_log_index(&self) -> Result<LogIndex> {
         Ok(LogIndex(self.entries.len() as u64))
     }
 
-    fn latest_log_term(&self) -> result::Result<Term, Error> {
+    fn latest_log_term(&self) -> Result<Term> {
         let len = self.entries.len();
         if len == 0 {
             Ok(Term::from(0))
@@ -207,7 +255,7 @@ impl Log for FsLog {
         }
     }
 
-    fn entry(&self, index: LogIndex) -> result::Result<(Term, &[u8]), Error> {
+    fn entry(&self, index: LogIndex) -> Result<(Term, &[u8])> {
         let (term, ref bytes) = self.entries[(index - 1).as_u64() as usize];
         Ok((term, bytes))
     }
@@ -215,13 +263,15 @@ impl Log for FsLog {
     /// Append entries sent from the leader.  
     /// FIXME: This is contrary to the raft spec, and will cause errors, as it discards entries that may be
     /// necessary.  The entries should not be truncated unless a mismatch is found.
+    /// TODO: Write log entries to disk as they are added to the log
     fn append_entries(&mut self,
                       from: LogIndex,
                       entries: &[(Term, &[u8])])
-                      -> result::Result<(), Error> {
+                      -> Result<()> {
         assert!(self.latest_log_index().unwrap() + 1 >= from);
         self.entries.truncate((from - 1).as_u64() as usize);  
-        Ok(self.entries.extend(entries.iter().map(|&(term, command)| (term, command.to_vec()))))
+        self.entries.extend(entries.iter().map(|&(term, command)| (term, command.to_vec())));
+        Ok(())
     }
 }
 
