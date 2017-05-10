@@ -18,7 +18,7 @@ use Term;
 
 /// Error type for FsLog
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Error;
 
 impl fmt::Display for Error {
@@ -90,6 +90,8 @@ fn u64_to_u8s(input: u64) -> [u8; 8] {
     ]
 }
 
+/// Stores log as 8 bytes for current_term, 8 bytes for voted_for, and 
+/// As much as needed for the log.
 impl FsLog {
     pub fn new(filename: &path::Path) -> Result<FsLog, Error> {
         let mut f = fs::OpenOptions::new()
@@ -100,14 +102,22 @@ impl FsLog {
 
         let mut buf = [0u8; 8];
         let voted_buf = [0xff as u8; 8];
-
+        
+        { 
+            let mut read_buf = Vec::new();
+            f.read_to_end(&mut read_buf).unwrap();
+            println!("Read: {:?}", read_buf);
+            f.seek(SeekFrom::Start(0)).unwrap();
+        }
+                 
+        assert_eq!(f.seek(SeekFrom::Start(0)).unwrap(), 0);
         if f.metadata()?.len() == 0 {
-            f.seek(SeekFrom::Start(0))?;
+            println!("Empty file");
             f.write_all(&buf)?;
             f.write_all(&voted_buf)?;
+            f.seek(SeekFrom::Start(0))?;
         }
 
-        f.seek(SeekFrom::Start(0))?;
         f.read_exact(&mut buf)?;
         let current_term: Term = u64_from_u8s(&buf).unwrap().into();
 
@@ -116,6 +126,7 @@ impl FsLog {
             x if x == <u64>::max_value() => None,
             x => Some(x.into())
         };
+
         let log = FsLog {
             file: f,
             current_term: current_term,
@@ -123,6 +134,14 @@ impl FsLog {
             entries: Vec::new(),
         };
         Ok(log)
+    }
+
+    fn print_file(&mut self) -> Result<(), Error> {
+        let mut buf = Vec::new();
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.read_to_end(&mut buf)?;
+        println!("File: {:?}", buf);
+        Ok(())
     }
 
     fn write_term(&mut self) -> Result<(), Error> {
@@ -152,15 +171,15 @@ impl Log for FsLog {
     }
 
     fn set_current_term(&mut self, term: Term) -> result::Result<(), Error> {
-        self.voted_for = None;
         self.current_term = term;
+        self.voted_for = None;
         self.write_term()?;
         Ok(())
     }
 
     fn inc_current_term(&mut self) -> result::Result<Term, Error> {
-        self.voted_for = None;
         self.current_term = self.current_term + 1;
+        self.voted_for = None;
         self.write_term()?;
         self.current_term()
     }
@@ -219,6 +238,7 @@ mod test {
     #[test]
     fn test_current_term() {
         let filename = Path::new("/tmp/raft-store.1");
+        remove_file(&filename).unwrap_or(());
         let mut store = FsLog::new(&filename).unwrap();
         assert_eq!(Term(0), store.current_term().unwrap());
         store.set_voted_for(ServerId::from(0)).unwrap();
@@ -233,6 +253,7 @@ mod test {
     #[test]
     fn test_voted_for() {
         let filename = Path::new("/tmp/raft-store.2");
+        remove_file(&filename).unwrap_or(());
         let mut store = FsLog::new(&filename).unwrap();
         assert_eq!(None, store.voted_for().unwrap());
         let id = ServerId::from(0);
@@ -244,6 +265,7 @@ mod test {
     #[test]
     fn test_append_entries() {
         let filename = Path::new("/tmp/raft-store.3");
+        remove_file(&filename).unwrap_or(());
         let mut store = FsLog::new(&filename).unwrap();
         assert_eq!(LogIndex::from(0), store.latest_log_index().unwrap());
         assert_eq!(Term::from(0), store.latest_log_term().unwrap());
@@ -289,6 +311,38 @@ mod test {
                    store.entry(LogIndex::from(3)).unwrap());
         assert_eq!((Term::from(3), &*vec![4u8]),
                    store.entry(LogIndex::from(4)).unwrap());
+        remove_file(&filename).unwrap();
+    }
+
+    #[test]
+    fn test_restore_log() {
+        let filename = Path::new("/tmp/raft-store.4");
+        remove_file(&filename).unwrap_or(());
+        {
+            let mut store = FsLog::new(&filename).unwrap();
+            store.set_current_term(Term(42)).unwrap();
+            store.set_voted_for(ServerId::from(4)).unwrap();
+            store.append_entries(LogIndex(1),
+                                &[(Term::from(0), &[1]),
+                                (Term::from(0), &[2]),
+                                (Term::from(0), &[3]),
+                                (Term::from(1), &[4])])
+                .unwrap();
+            println!("Voted for: {:?}", store.voted_for());
+            println!("Print file");
+            store.print_file();
+        }
+
+        // New store with the same backing file starts with the same state.
+        let mut store = FsLog::new(&filename).unwrap();
+        println!("Print restored file");
+        store.print_file();
+        assert_eq!(store.voted_for().unwrap(), Some(ServerId::from(4)));
+        assert_eq!(store.current_term().unwrap(), Term(42));
+        assert_eq!(
+            store.entry(LogIndex::from(4)).unwrap(),
+            (Term::from(1), &*vec![4u8])
+        );
         remove_file(&filename).unwrap();
     }
 }
