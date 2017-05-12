@@ -108,14 +108,12 @@ impl FsLog {
         { 
             let mut read_buf = Vec::new();
             f.read_to_end(&mut read_buf).unwrap();
-            println!("Read: {:?}", read_buf);
             f.seek(SeekFrom::Start(0)).unwrap();
         }
                  
         assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 0);
         let filelen = f.metadata()?.len();
         if filelen == 0 {
-            println!("Empty file");
             f.write_all(&buf)?;
             f.write_all(&not_voted)?;
             f.seek(SeekFrom::Start(0))?;
@@ -144,17 +142,8 @@ impl FsLog {
             let entry = log.read_entry(offset_len - 1)?;
             log.entries.push(entry);
             offset = log.file.seek(SeekFrom::Current(0))?;
-            println!("Offset: {}", offset);
         }
         Ok(log)
-    }
-
-    fn print_file(&mut self) -> Result<()> {
-        let mut buf = Vec::new();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_to_end(&mut buf)?;
-        println!("File: {:?}", buf);
-        Ok(())
     }
 
     fn write_term(&mut self) -> Result<()> {
@@ -177,31 +166,35 @@ impl FsLog {
 
     fn read_entry(&mut self, index: usize) -> Result<Entry> {
         // Could be more efficient about not copying data here.
+        let filelen = self.file.metadata()?.len();
         let offset = self.offsets.get(index).ok_or(Error)?;
-        self.file.seek(SeekFrom::Start(*offset))?;
         let mut buf = [0u8; 8];
-        self.file.read_exact(&mut buf);
+        self.file.read_exact(&mut buf)?;
         let length = u64_from_u8s(&buf[..]) as usize;
 
-        let mut buf = Vec::with_capacity(length - 8);
-        self.file.read_exact(&mut buf[..])?;
-        let term = u64_from_u8s(&buf[..8]).into();
-        let command = (&buf[8..]).to_owned();
+        let mut vecbuf = vec![0u8; length - 8];
+        let end = *offset as usize + length;
+        self.file.read_exact(&mut vecbuf[0..(length - 8) as usize])?;
+        let term = u64_from_u8s(&vecbuf[..8]).into();
+        let command = (&vecbuf[8..]).to_owned();
         Ok((term, command))
     }
 
+    fn truncate_file(&mut self, index: usize) -> Result<()> {
+        match self.offsets.get(index) {
+            None => {},
+            Some(offset) => self.file.set_len(*offset)?,
+        };
+        Ok(())
+    }
+
     ///Add an entry to the log
-    fn write_entry(&mut self, index: usize, entry: Entry) -> Result<()> {
+    fn write_entry(&mut self, index: usize, term: Term, command: &[u8]) -> Result<()> {
         if index > self.entries.len() {
             Err(Error)
         } else {
-            if index < self.entries.len() {
-                let offset = self.offsets.get(index).ok_or(Error)?;
-                self.file.set_len(*offset)?;
-            } 
             let new_offset = self.file.seek(SeekFrom::End(0))?;
             self.offsets.push(new_offset);
-            let (term, command) = entry;
             let entry_len = (command.len() + 16) as u64;
             self.file.write_all(&u64_to_u8s(entry_len)[..])?;
             self.file.write_all(&u64_to_u8s(term.into())[..])?;
@@ -269,8 +262,16 @@ impl Log for FsLog {
                       entries: &[(Term, &[u8])])
                       -> Result<()> {
         assert!(self.latest_log_index().unwrap() + 1 >= from);
-        self.entries.truncate((from - 1).as_u64() as usize);  
+        let mut index = (from - 1).as_u64() as usize;
+        self.truncate_file(index);
+        self.entries.truncate(index);  
+        self.offsets.truncate(index);  
         self.entries.extend(entries.iter().map(|&(term, command)| (term, command.to_vec())));
+        for &(term, command) in entries {
+            self.write_entry(index, term, command)?;
+            index += 1;
+        }
+        let index = (from - 1).as_u64() as usize;
         Ok(())
     }
 }
@@ -338,6 +339,7 @@ mod test {
         assert_eq!((Term::from(1), &*vec![4u8]),
                    store.entry(LogIndex::from(4)).unwrap());
 
+        assert_eq!(store.offsets, [16, 33, 50, 67]);
         // [0.1, 0.2, 0.3]
         store.append_entries(LogIndex::from(4), &[]).unwrap();
         assert_eq!(LogIndex(3), store.latest_log_index().unwrap());
@@ -378,21 +380,17 @@ mod test {
                                 (Term::from(0), &[3]),
                                 (Term::from(1), &[4])])
                 .unwrap();
-            println!("Voted for: {:?}", store.voted_for());
-            println!("Print file");
-            store.print_file();
         }
 
         // New store with the same backing file starts with the same state.
         let mut store = FsLog::new(&filename).unwrap();
-        println!("Print restored file");
-        store.print_file();
         assert_eq!(store.voted_for().unwrap(), Some(ServerId::from(4)));
         assert_eq!(store.current_term().unwrap(), Term(42));
         assert_eq!(
             store.entry(LogIndex::from(4)).unwrap(),
             (Term::from(1), &*vec![4u8])
         );
+        assert_eq!(store.offsets, [16, 33, 50, 67]);
         remove_file(&filename).unwrap();
     }
 }
